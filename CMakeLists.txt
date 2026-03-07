@@ -13,6 +13,7 @@ add_executable(dxgi_nvenc_demo
   src/main.cpp
   src/dda_capture.cpp
   src/nvenc_encoder.cpp
+  src/qsv_encoder.cpp
   src/nvdec_decoder.cpp
   src/d3d11_renderer.cpp
 )
