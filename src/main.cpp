@@ -154,89 +154,72 @@ struct BenchResult {
     double capture_ms, encode_ms, total_ms;
 };
 
-static BenchResult BenchmarkNvenc(DDACapture& capture)
+// Run benchmark for any encoder via lambda.
+// cap_ms = DDA wait time (how long AcquireFrame blocked, NOT encode latency)
+// enc_ms = pure encode time (frame ready → bitstream ready) — the real latency metric
+// frame_ms = cap+enc per-frame wall time (≈ 1/fps at steady state)
+template<typename EncFn>
+static BenchResult RunBench(const char* name, DDACapture& capture, EncFn encode_fn)
 {
-    int W = capture.Width(), H = capture.Height();
-    NvencEncoder encoder;
-    encoder.Init(capture.GetDevice(), W, H, TARGET_FPS);
-
-    PerfStats stats;
-    int frame_count = 0;
-    int skip = 60; // warmup frames
-
-    while (frame_count < BENCH_FRAMES + skip) {
-        PumpMessages();
-        double t_start = NowMs();
-
-        CaptureFrame cap_frame;
-        if (!capture.AcquireFrame(cap_frame, FRAME_BUDGET)) continue;
-        double t_enc0 = NowMs();
-        double capture_ms = t_enc0 - t_start;
-
-        AVPacket* pkt = encoder.EncodeFrame(cap_frame.texture.Get());
-        capture.ReleaseFrame();
-        double encode_ms = NowMs() - t_enc0;
-        double total_ms  = NowMs() - t_start;
-
-        if (pkt) av_packet_free(&pkt);
-
-        if (frame_count >= skip) {
-            stats.capture_ms.Add(capture_ms);
-            stats.encode_ms.Add(encode_ms);
-            stats.total_ms.Add(total_ms);
-        }
-        frame_count++;
-
-        if (frame_count % 60 == 0)
-            printf("  [NVENC] frame %d: cap=%.2f enc=%.2f total=%.2f ms\n",
-                   frame_count, capture_ms, encode_ms, total_ms);
-    }
-    return {"NVENC (h264_nvenc p4/ull CBR)",
-            stats.capture_ms.Avg(), stats.encode_ms.Avg(), stats.total_ms.Avg()};
-}
-
-static BenchResult BenchmarkQsv(DDACapture& capture)
-{
-    int W = capture.Width(), H = capture.Height();
-    QsvEncoder encoder;
-    if (!encoder.Init(capture.GetDevice(), W, H, TARGET_FPS)) {
-        printf("  [QSV] Init failed — skipping QSV benchmark\n");
-        return {"QSV (SKIPPED)", 0, 0, 0};
-    }
-
-    PerfStats stats;
+    RollingAvg<120> cap_avg, enc_avg, frame_avg;
     int frame_count = 0;
     int skip = 60;
 
     while (frame_count < BENCH_FRAMES + skip) {
         PumpMessages();
-        double t_start = NowMs();
+        double t_frame_start = NowMs();
 
+        // DDA wait: how long until desktop has a new frame
         CaptureFrame cap_frame;
+        double t_cap0 = NowMs();
         if (!capture.AcquireFrame(cap_frame, FRAME_BUDGET)) continue;
+        double dda_wait_ms = NowMs() - t_cap0;  // just waiting, not real work
+
+        // Encode: frame available → bitstream ready (the real latency)
         double t_enc0 = NowMs();
-        double capture_ms = t_enc0 - t_start;
-
-        AVPacket* pkt = encoder.EncodeFrame(cap_frame.texture.Get());
+        AVPacket* pkt = encode_fn(cap_frame.texture.Get());
         capture.ReleaseFrame();
-        double encode_ms = NowMs() - t_enc0;
-        double total_ms  = NowMs() - t_start;
+        double enc_ms = NowMs() - t_enc0;
 
+        double frame_ms = NowMs() - t_frame_start;
         if (pkt) av_packet_free(&pkt);
 
         if (frame_count >= skip) {
-            stats.capture_ms.Add(capture_ms);
-            stats.encode_ms.Add(encode_ms);
-            stats.total_ms.Add(total_ms);
+            cap_avg.Add(dda_wait_ms);
+            enc_avg.Add(enc_ms);
+            frame_avg.Add(frame_ms);
         }
         frame_count++;
 
         if (frame_count % 60 == 0)
-            printf("  [QSV]   frame %d: cap=%.2f enc=%.2f total=%.2f ms\n",
-                   frame_count, capture_ms, encode_ms, total_ms);
+            printf("  [%s] frame %d: dda_wait=%.2f  encode=%.2f  frame=%.2f ms\n",
+                   name, frame_count, dda_wait_ms, enc_ms, frame_ms);
     }
-    return {"QSV  (h264_qsv veryfast CBR + CPU NV12)",
-            stats.capture_ms.Avg(), stats.encode_ms.Avg(), stats.total_ms.Avg()};
+
+    printf("  [%s] avg: dda_wait=%.2f  encode=%.2f  frame=%.2f ms\n",
+           name, cap_avg.Avg(), enc_avg.Avg(), frame_avg.Avg());
+    printf("  Note: encode_ms is the real latency. dda_wait is display refresh timing.\n\n");
+
+    return {name, cap_avg.Avg(), enc_avg.Avg(), frame_avg.Avg()};
+}
+
+static BenchResult BenchmarkNvenc(DDACapture& capture)
+{
+    NvencEncoder encoder;
+    encoder.Init(capture.GetDevice(), capture.Width(), capture.Height(), TARGET_FPS);
+    return RunBench("NVENC", capture,
+        [&](ID3D11Texture2D* tex) { return encoder.EncodeFrame(tex); });
+}
+
+static BenchResult BenchmarkQsv(DDACapture& capture)
+{
+    QsvEncoder encoder;
+    if (!encoder.Init(capture.GetDevice(), capture.Width(), capture.Height(), TARGET_FPS)) {
+        printf("  [QSV] Init failed\n");
+        return {"QSV (FAILED)", 0, 0, 0};
+    }
+    return RunBench("QSV", capture,
+        [&](ID3D11Texture2D* tex) { return encoder.EncodeFrame(tex); });
 }
 
 static void RunBenchmark()
@@ -266,19 +249,22 @@ static void RunBenchmark()
            "NVENC p4/ull CBR",
            r_nvenc.capture_ms, r_nvenc.encode_ms, r_nvenc.total_ms);
     printf("| %-20s | %8.2f | %8.2f | %11.2f |\n",
-           r_qsv.total_ms > 0 ? "QSV veryfast CBR" : "QSV (FAILED)",
+           r_qsv.encode_ms > 0 ? "QSV veryfast BGRA" : "QSV (FAILED)",
            r_qsv.capture_ms, r_qsv.encode_ms, r_qsv.total_ms);
     printf("+----------------------+----------+----------+--------------+\n");
 
-    if (r_qsv.total_ms > 0) {
-        double diff = r_nvenc.total_ms - r_qsv.total_ms;
+    if (r_qsv.encode_ms > 0) {
+        printf("\n*** Key metric: encode_ms (frame ready -> bitstream ready) ***\n");
+        double diff = r_qsv.encode_ms - r_nvenc.encode_ms;
+        printf("NVENC encode latency : %.2f ms\n", r_nvenc.encode_ms);
+        printf("QSV   encode latency : %.2f ms\n", r_qsv.encode_ms);
         if (diff > 0)
-            printf("\nNVENC is %.2f ms SLOWER (QSV wins in encode+copy total)\n", diff);
+            printf("NVENC is %.2f ms FASTER in pure encode latency\n", diff);
         else
-            printf("\nNVENC is %.2f ms FASTER (NVENC wins in encode+copy total)\n", -diff);
-        printf("\nNote: QSV encode path includes CPU BGRA->NV12 via swscale.\n");
-        printf("      With D3D11 Video Processor (GPU color convert), QSV\n");
-        printf("      total would drop by ~2-3ms (no CPU color conversion).\n");
+            printf("QSV is %.2f ms FASTER in pure encode latency\n", -diff);
+        printf("\nNote: dda_wait_ms is NOT a latency metric. It reflects how long\n");
+        printf("AcquireFrame blocked waiting for the next display refresh (up to 16ms\n");
+        printf("at 60Hz). Fast encoders finish early and wait longer; slow ones wait less.\n");
     }
 }
 
