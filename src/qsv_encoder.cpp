@@ -132,7 +132,7 @@ bool QsvEncoder::Init(ID3D11Device* cap_device, int width, int height, int fps)
     sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     cap_device_->CreateTexture2D(&sd, nullptr, &staging_tex_);
 
-    // --- swscale context: BGRA â†’ NV12 (SIMD-accelerated) ---
+    // --- swscale context: BGRA â†?NV12 (SIMD-accelerated) ---
     sws_ctx_ = sws_getContext(
         width_, height_, AV_PIX_FMT_BGRA,
         width_, height_, AV_PIX_FMT_NV12,
@@ -172,11 +172,11 @@ static inline double NowMsQsv() {
     return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
 }
 
-AVPacket* QsvEncoder::EncodeFrame(ID3D11Texture2D* src)
+AVPacket* QsvEncoder::EncodeFrame(ID3D11Texture2D* src, int64_t pts_override)
 {
     double t0 = NowMsQsv();
 
-    // GPU copy DDA tex â†’ staging (same Intel adapter, always needed for CPU read)
+    // GPU copy DDA tex â†?staging (same Intel adapter, always needed for CPU read)
     cap_context_->CopyResource(staging_tex_.Get(), src);
     double t1 = NowMsQsv();
 
@@ -214,7 +214,7 @@ AVPacket* QsvEncoder::EncodeFrame(ID3D11Texture2D* src)
     }
     double t5 = NowMsQsv();
 
-    hw_frame_->pts = pts_++;
+    hw_frame_->pts = (pts_override >= 0) ? pts_override : pts_++; pts_++;
     if (avcodec_send_frame(codec_ctx_, hw_frame_) < 0) return nullptr;
     double t6 = NowMsQsv();
 

@@ -11,11 +11,11 @@ extern "C" {
 }
 
 // QSV encoder: runs on the same Intel adapter as DDA capture.
-// No cross-adapter copy needed â€” src texture is already on the Intel GPU.
+// No cross-adapter copy needed â€?src texture is already on the Intel GPU.
 class QsvEncoder {
 public:
     bool Init(ID3D11Device* cap_device, int width, int height, int fps);
-    AVPacket* EncodeFrame(ID3D11Texture2D* src);  // src on Intel device
+    AVPacket* EncodeFrame(ID3D11Texture2D* src, int64_t pts = -1);  // src on Intel device
     AVPacket* Flush();
     void Release();
 

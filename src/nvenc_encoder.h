@@ -21,7 +21,7 @@ public:
 
     // Encode a DDA-captured texture. Returns an AVPacket* (caller must av_packet_free).
     // Returns nullptr if no packet ready (shouldn't happen in CBR low-latency mode).
-    AVPacket* EncodeFrame(ID3D11Texture2D* src_texture);
+    AVPacket* EncodeFrame(ID3D11Texture2D* src_texture, int64_t pts = -1);
 
     // Flush and return remaining packets. Returns nullptr when done.
     AVPacket* Flush();

@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <string>
 #include <stdio.h>
+#include <unordered_map>
 
 static const int TARGET_FPS    = 60;
 static const int FRAME_BUDGET  = 1000 / TARGET_FPS;
@@ -222,6 +223,123 @@ static BenchResult BenchmarkQsv(DDACapture& capture)
         [&](ID3D11Texture2D* tex) { return encoder.EncodeFrame(tex); });
 }
 
+// ---- End-to-end latency: DDA frame ready → decoder outputs frame --------
+// Uses pts as timestamp key to match captured frame to decoded output.
+// With async encoders (NVENC): the packet comes out 1+ frames later,
+// so true e2e = time(decode_out) - time(cap_in for THAT pts).
+template<typename EncFn>
+static void RunE2E(const char* name, DDACapture& capture,
+                   NvdecDecoder& decoder, EncFn encode_fn)
+{
+    printf("\n--- E2E latency: %s ---\n", name);
+    printf("Measuring: DDA frame ready → decoder outputs that frame\n\n");
+
+    // pts → capture wall time
+    std::unordered_map<int64_t, double> cap_time;
+
+    RollingAvg<120> e2e_avg;
+    int64_t pts_in  = 0;   // frames sent to encoder
+    int     decoded = 0;   // frames successfully decoded
+    int     skip    = 30;  // warmup
+
+    // Run until we have BENCH_FRAMES decoded frames
+    while (decoded < BENCH_FRAMES + skip) {
+        PumpMessages();
+
+        // ---- Capture ----
+        CaptureFrame cap_frame;
+        if (!capture.AcquireFrame(cap_frame, FRAME_BUDGET)) continue;
+
+        double t_cap_done = NowMs();  // frame is in our hands
+        int64_t this_pts  = pts_in++;
+        cap_time[this_pts] = t_cap_done;
+
+        // ---- Encode (may be async: packet = previous frame) ----
+        AVPacket* pkt = encode_fn(cap_frame.texture.Get(), this_pts);
+        capture.ReleaseFrame();
+
+        if (!pkt) continue;  // encoder still buffering
+
+        // ---- Decode ----
+        int64_t pkt_pts = pkt->pts;  // which capture frame does this packet represent?
+        DecodedFrame dec_frame;
+        bool ok = decoder.Decode(pkt, dec_frame);
+        av_packet_free(&pkt);
+
+        if (!ok) continue;
+
+        double t_decoded = NowMs();  // decoder just produced this frame
+
+        // Match decoded pts back to original capture time
+        auto it = cap_time.find(pkt_pts);
+        if (it != cap_time.end()) {
+            double e2e_ms = t_decoded - it->second;
+            cap_time.erase(it);  // free slot
+
+            decoded++;
+            if (decoded > skip) {
+                e2e_avg.Add(e2e_ms);
+                if (decoded % 60 == 0 || decoded <= 5)
+                    printf("  [%s] decoded=%d  e2e=%.2f ms (cap_pts=%lld)\n",
+                           name, decoded, e2e_ms, (long long)pkt_pts);
+            }
+        }
+        // Clean up old entries (encoder may drop/reorder)
+        if (cap_time.size() > 64) cap_time.clear();
+    }
+
+    printf("\n  [%s] E2E latency avg over %d frames: %.2f ms\n",
+           name, BENCH_FRAMES, e2e_avg.Avg());
+    printf("  (includes: DDA wait + encode + decode, excludes network/render)\n");
+}
+
+static void RunE2EBenchmark()
+{
+    printf("\n=== END-TO-END LATENCY BENCHMARK ===\n");
+    printf("Metric: DDA frame ready -> decoder outputs decoded frame\n");
+    printf("(This is the real streaming latency before render/network)\n\n");
+
+    DDACapture capture;
+    if (!capture.Init(0)) { fprintf(stderr, "DDA init failed\n"); return; }
+    printf("Capture: %dx%d\n\n", capture.Width(), capture.Height());
+
+    // --- NVENC path: encode on NVIDIA, decode on NVIDIA ---
+    {
+        NvencEncoder enc;
+        enc.Init(capture.GetDevice(), capture.Width(), capture.Height(), TARGET_FPS);
+
+        NvdecDecoder dec;
+        dec.Init(enc.GetEncDevice(), capture.Width(), capture.Height());
+
+        int64_t pts = 0;
+        RunE2E("NVENC+NVDEC", capture, dec,
+               [&](ID3D11Texture2D* tex, int64_t p) -> AVPacket* {
+                   return enc.EncodeFrame(tex, p);
+               });
+    }
+
+    // --- QSV path: encode on Intel, decode on NVIDIA (reuse existing NVDEC) ---
+    {
+        QsvEncoder enc;
+        if (!enc.Init(capture.GetDevice(), capture.Width(), capture.Height(), TARGET_FPS)) {
+            printf("[QSV] Init failed, skipping QSV E2E\n");
+            return;
+        }
+
+        // For QSV decode: use d3d11va on Intel device (same adapter as encode)
+        NvdecDecoder dec;
+        // Use a temp NVIDIA device for decode (reuse existing pattern)
+        NvencEncoder tmp_enc;
+        tmp_enc.Init(capture.GetDevice(), 16, 16, 30);  // tiny dummy for device
+        dec.Init(tmp_enc.GetEncDevice(), capture.Width(), capture.Height());
+
+        RunE2E("QSV+NVDEC", capture, dec,
+               [&](ID3D11Texture2D* tex, int64_t p) -> AVPacket* {
+                   return enc.EncodeFrame(tex, p);
+               });
+    }
+}
+
 static void RunBenchmark()
 {
     printf("\n=== ENCODER BENCHMARK: NVENC vs QSV ===\n");
@@ -275,23 +393,25 @@ int main(int argc, char** argv)
     setvbuf(stderr, nullptr, _IONBF, 0);
 
     bool benchmark = false;
+    bool e2e       = false;
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--bench") == 0 || strcmp(argv[i], "-b") == 0)
-            benchmark = true;
+        if (strcmp(argv[i], "--bench") == 0 || strcmp(argv[i], "-b") == 0) benchmark = true;
+        if (strcmp(argv[i], "--e2e")   == 0 || strcmp(argv[i], "-e") == 0) e2e = true;
     }
 
     printf("DXGI Desktop Duplication + NVENC/QSV Pipeline Demo\n");
     printf("===================================================\n");
-    printf("Usage: dxgi_nvenc_demo.exe [--bench]\n");
-    printf("  (no args)  : NVENC live pipeline with window\n");
-    printf("  --bench    : NVENC vs QSV benchmark (no decode/render)\n\n");
+    printf("Usage: dxgi_nvenc_demo.exe [--bench | --e2e]\n");
+    printf("  (no args) : NVENC live pipeline with window\n");
+    printf("  --bench   : NVENC vs QSV encode latency benchmark\n");
+    printf("  --e2e     : End-to-end latency (DDA frame ready -> decoded) benchmark\n\n");
 
-    if (benchmark) {
-        // Create a hidden window just to have a valid message loop
+    if (benchmark || e2e) {
         g_hwnd = CreateAppWindow(100, 100, "Benchmark running...");
         ShowWindow(g_hwnd, SW_HIDE);
-        RunBenchmark();
-        printf("\nBenchmark complete. Press Enter to exit.\n");
+        if (e2e) RunE2EBenchmark();
+        else     RunBenchmark();
+        printf("\nDone. Press Enter to exit.\n");
         getchar();
         DestroyWindow(g_hwnd);
         return 0;

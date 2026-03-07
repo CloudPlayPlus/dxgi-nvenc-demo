@@ -121,6 +121,7 @@ bool NvencEncoder::Init(ID3D11Device* capture_device, int width, int height, int
     av_opt_set_int(p, "rc-lookahead",   0,     0);
     av_opt_set_int(p, "no-scenecut",    1,     0);
     av_opt_set_int(p, "forced-idr",     1,     0);
+    av_opt_set_int(p, "delay",          0,     0);  // async_depth=1 (no pipeline buffering)
 
     int ret = avcodec_open2(codec_ctx_, codec, nullptr);
     if (ret < 0) {
@@ -218,7 +219,7 @@ bool NvencEncoder::CopyToEncoderTexture(ID3D11Texture2D* src)
         return true;
 
     case XferMode::ZeroCopy: {
-        // Step 1: Intel GPU copies DDA tex → shared tex (GPU blit, same adapter, fast)
+        // Step 1: Intel GPU copies DDA tex �?shared tex (GPU blit, same adapter, fast)
         cap_ctx->CopyResource(shared_tex_intel_.Get(), src);
         cap_ctx->Flush();  // ensure GPU commands submitted before NVIDIA reads
 
@@ -241,13 +242,32 @@ bool NvencEncoder::CopyToEncoderTexture(ID3D11Texture2D* src)
     }
 }
 
-AVPacket* NvencEncoder::EncodeFrame(ID3D11Texture2D* src)
+static inline double NowMsNvenc() {
+    LARGE_INTEGER f, t;
+    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+
+AVPacket* NvencEncoder::EncodeFrame(ID3D11Texture2D* src, int64_t pts_override)
 {
+    double t0 = NowMsNvenc();
     if (!CopyToEncoderTexture(src)) return nullptr;
-    hw_frame_->pts = pts_++;
+    double t1 = NowMsNvenc();  // cross-adapter copy done
+
+    hw_frame_->pts = (pts_override >= 0) ? pts_override : pts_++; pts_++;
     if (avcodec_send_frame(codec_ctx_, hw_frame_) < 0) return nullptr;
+    double t2 = NowMsNvenc();  // send_frame returned
+
     AVPacket* pkt = av_packet_alloc();
-    if (avcodec_receive_packet(codec_ctx_, pkt) == 0) return pkt;
+    bool got = avcodec_receive_packet(codec_ctx_, pkt) == 0;
+    double t3 = NowMsNvenc();  // receive_packet returned
+
+    if (pts_ % 60 == 1) {
+        printf("  [NVENC breakdown] xfer=%.2f send=%.2f recv=%.2f | total=%.2f ms  pkt=%s\n",
+               t1-t0, t2-t1, t3-t2, t3-t0, got ? "YES" : "NO(buffering)");
+    }
+
+    if (got) return pkt;
     av_packet_free(&pkt);
     return nullptr;
 }
