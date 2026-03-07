@@ -1,64 +1,56 @@
 #pragma once
-
 #include <d3d11.h>
 #include <wrl/client.h>
-#include <string>
-#include <cstdint>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
-#include <libavutil/pixdesc.h>
-#include <libavformat/avformat.h>
 }
 
 using Microsoft::WRL::ComPtr;
 
 class NvencEncoder {
 public:
-    NvencEncoder() = default;
+    NvencEncoder()  = default;
     ~NvencEncoder() { Release(); }
 
-    // Initialize encoder.
-    // capture_device: the D3D11 device used for DDA capture (may be iGPU)
-    // width, height: frame dimensions
-    // fps: target frame rate
-    bool Init(ID3D11Device* capture_device, int width, int height, int fps = 30);
+    // Init NVENC encoder on the NVIDIA dGPU.
+    // capture_device: the device used for DDA (may be iGPU).
+    bool Init(ID3D11Device* capture_device, int width, int height, int fps = 60);
 
-    // Encode a captured D3D11 texture.
-    // The texture may be on a different adapter; we handle cross-adapter copy internally.
-    // outfile: write encoded H264 to this file (nullptr = don't write)
-    bool EncodeFrame(ID3D11Texture2D* src_texture, FILE* outfile);
+    // Encode a DDA-captured texture. Returns an AVPacket* (caller must av_packet_free).
+    // Returns nullptr if no packet ready (shouldn't happen in CBR low-latency mode).
+    AVPacket* EncodeFrame(ID3D11Texture2D* src_texture);
 
-    void Flush(FILE* outfile);
+    // Flush and return remaining packets. Returns nullptr when done.
+    AVPacket* Flush();
+
+    // Access the NVIDIA device (for decoder/renderer to share)
+    ID3D11Device*        GetEncDevice()  const { return enc_device_.Get(); }
+    ID3D11DeviceContext* GetEncContext() const { return enc_context_.Get(); }
+
+    int Width()  const { return width_; }
+    int Height() const { return height_; }
 
 private:
     void Release();
-    bool SetupCrossAdapterIfNeeded(ID3D11Device* capture_device);
+    bool SetupCrossAdapter(ID3D11Device* cap_dev);
     bool CopyToEncoderTexture(ID3D11Texture2D* src);
-    void WritePackets(AVCodecContext* ctx, AVFrame* frame, FILE* outfile);
 
-    // FFmpeg encoder context (always on NVIDIA dGPU via d3d11va)
-    AVBufferRef*    hw_device_ctx_  = nullptr;
-    AVBufferRef*    hw_frame_ctx_   = nullptr;
-    AVCodecContext* codec_ctx_      = nullptr;
-    AVFrame*        hw_frame_       = nullptr;
-    AVPacket*       packet_         = nullptr;
+    AVBufferRef*    hw_device_ctx_ = nullptr;
+    AVBufferRef*    hw_frame_ctx_  = nullptr;
+    AVCodecContext* codec_ctx_     = nullptr;
+    AVFrame*        hw_frame_      = nullptr;
+    int64_t         pts_           = 0;
 
-    int width_  = 0;
-    int height_ = 0;
-    int fps_    = 30;
-    int64_t pts_ = 0;
-
-    // Encoder D3D11 device (NVIDIA dGPU)
     ComPtr<ID3D11Device>        enc_device_;
     ComPtr<ID3D11DeviceContext> enc_context_;
+    ComPtr<ID3D11Device>        cap_device_;   // capture device (iGPU)
+    ComPtr<ID3D11Texture2D>     staging_tex_;  // CPU-readable staging on cap_device
 
-    // Cross-adapter: staging texture on capture device (iGPU)
-    // Used to CPU-copy from iGPU texture to upload into encoder device
-    ComPtr<ID3D11Texture2D>     staging_texture_;   // on capture_device (iGPU), CPU-readable
-    ComPtr<ID3D11Device>        capture_device_;    // reference, not owned
-
-    bool same_adapter_ = false;  // true if capture and encode are on same GPU
+    bool    same_adapter_ = false;
+    int     width_  = 0;
+    int     height_ = 0;
+    int     fps_    = 60;
 };
