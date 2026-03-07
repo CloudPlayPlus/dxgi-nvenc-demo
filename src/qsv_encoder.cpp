@@ -136,31 +136,57 @@ bool QsvEncoder::Init(ID3D11Device* cap_device, int width, int height, int fps)
     return true;
 }
 
+// Simple timer helper (ms)
+static inline double NowMsQsv() {
+    LARGE_INTEGER f, t;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+
 AVPacket* QsvEncoder::EncodeFrame(ID3D11Texture2D* src)
 {
+    double t0 = NowMsQsv();
+
     // Step 1: GPU copy DDA tex → staging (same Intel adapter)
     cap_context_->CopyResource(staging_tex_.Get(), src);
+    double t1 = NowMsQsv();
 
     // Step 2: CPU map staging → BGRA pointer
     D3D11_MAPPED_SUBRESOURCE m = {};
     if (FAILED(cap_context_->Map(staging_tex_.Get(), 0, D3D11_MAP_READ, 0, &m))) return nullptr;
+    double t2 = NowMsQsv();
 
-    // Step 3: swscale BGRA → NV12 (SIMD, ~2-3ms at 2560x1600)
+    // Step 3: swscale BGRA → NV12 (SIMD)
     const uint8_t* src_planes[1] = { (const uint8_t*)m.pData };
     int src_strides[1] = { (int)m.RowPitch };
     sws_scale(sws_ctx_, src_planes, src_strides, 0, height_,
               sw_frame_->data, sw_frame_->linesize);
+    double t3 = NowMsQsv();
 
     cap_context_->Unmap(staging_tex_.Get(), 0);
+    double t4 = NowMsQsv();
 
     // Step 4: upload NV12 sw frame → QSV hw frame
     if (av_hwframe_transfer_data(hw_frame_, sw_frame_, 0) < 0) return nullptr;
+    double t5 = NowMsQsv();
 
     // Step 5: QSV encode
     hw_frame_->pts = pts_++;
     if (avcodec_send_frame(codec_ctx_, hw_frame_) < 0) return nullptr;
+    double t6 = NowMsQsv();
+
     AVPacket* pkt = av_packet_alloc();
-    if (avcodec_receive_packet(codec_ctx_, pkt) == 0) return pkt;
+    bool got_pkt = avcodec_receive_packet(codec_ctx_, pkt) == 0;
+    double t7 = NowMsQsv();
+
+    // Print breakdown every 60 frames
+    if (pts_ % 60 == 1) {
+        printf("  [QSV breakdown] gpu_copy=%.2f map=%.2f swscale=%.2f unmap=%.2f upload=%.2f send=%.2f recv=%.2f | total=%.2f ms\n",
+               t1-t0, t2-t1, t3-t2, t4-t3, t5-t4, t6-t5, t7-t6, t7-t0);
+    }
+
+    if (got_pkt) return pkt;
     av_packet_free(&pkt);
     return nullptr;
 }
