@@ -35,7 +35,8 @@ public:
 
 private:
     void Release();
-    bool SetupCrossAdapter(ID3D11Device* cap_dev);
+    bool SetupZeroCopy(ID3D11Device* cap_dev);
+    bool SetupCpuRoundtrip(ID3D11Device* cap_dev);
     bool CopyToEncoderTexture(ID3D11Texture2D* src);
 
     AVBufferRef*    hw_device_ctx_ = nullptr;
@@ -47,7 +48,18 @@ private:
     ComPtr<ID3D11Device>        enc_device_;
     ComPtr<ID3D11DeviceContext> enc_context_;
     ComPtr<ID3D11Device>        cap_device_;   // capture device (iGPU)
-    ComPtr<ID3D11Texture2D>     staging_tex_;  // CPU-readable staging on cap_device
+
+    // CPU roundtrip (fallback)
+    ComPtr<ID3D11Texture2D>     staging_tex_;
+
+    // Zero-copy shared handle path
+    ComPtr<ID3D11Texture2D>     shared_tex_intel_;   // BGRA shared tex on Intel (write side)
+    ComPtr<ID3D11Texture2D>     shared_tex_nvidia_;  // BGRA shared tex on NVIDIA (read side)
+    ComPtr<IDXGIKeyedMutex>     mutex_intel_;        // sync: Intel writes with key 0
+    ComPtr<IDXGIKeyedMutex>     mutex_nvidia_;       // sync: NVIDIA reads with key 1
+
+    enum class XferMode { SameAdapter, ZeroCopy, CpuRoundtrip };
+    XferMode xfer_mode_ = XferMode::CpuRoundtrip;
 
     bool    same_adapter_ = false;
     int     width_  = 0;
