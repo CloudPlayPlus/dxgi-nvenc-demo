@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="D:\dxgi-nvenc-demo\build\CMakeFiles\16ff41f668c0c1afc19ffd6a4485bd67\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{911EA0FF-B803-3C81-9E83-864E98C75628}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

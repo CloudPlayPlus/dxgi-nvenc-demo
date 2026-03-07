@@ -1,0 +1,3 @@
+D:/dxgi-nvenc-demo/build/CMakeFiles/dxgi_nvenc_demo.dir
+D:/dxgi-nvenc-demo/build/CMakeFiles/ALL_BUILD.dir
+D:/dxgi-nvenc-demo/build/CMakeFiles/ZERO_CHECK.dir
