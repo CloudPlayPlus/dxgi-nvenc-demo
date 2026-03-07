@@ -36,6 +36,8 @@ private:
     AVFrame*        sw_frame_     = nullptr;
     int64_t         pts_          = 0;
 
+    bool use_nv12_fallback_ = false;
+
     int width_  = 0;
     int height_ = 0;
     int fps_    = 60;

@@ -54,18 +54,38 @@ bool QsvEncoder::Init(ID3D11Device* cap_device, int width, int height, int fps)
         printf("[QSV] QSV device ready (derived from Intel D3D11VA)\n");
     }
 
-    // --- QSV NV12 frames context ---
+    // --- Try QSV BGRA frames context first (skip color conversion entirely) ---
+    // h264_qsv may support BGRA via Intel VPP internally (like NVENC does with BGRA)
     hw_frame_ctx_ = av_hwframe_ctx_alloc(qsv_ctx_);
     auto* fc = (AVHWFramesContext*)hw_frame_ctx_->data;
     fc->format             = AV_PIX_FMT_QSV;
-    fc->sw_format          = AV_PIX_FMT_NV12;
+    fc->sw_format          = AV_PIX_FMT_BGRA;  // try BGRA directly, like NVENC
     fc->width              = width_;
     fc->height             = height_;
     fc->initial_pool_size  = 32;
     ret = av_hwframe_ctx_init(hw_frame_ctx_);
     if (ret < 0) {
+        // BGRA not supported, fall back to NV12
         char e[128]; av_strerror(ret, e, sizeof(e));
-        fprintf(stderr, "[QSV] hwframe_ctx_init: %s\n", e); return false;
+        printf("[QSV] BGRA hw frames not supported (%s), falling back to NV12\n", e);
+        av_buffer_unref(&hw_frame_ctx_);
+
+        hw_frame_ctx_ = av_hwframe_ctx_alloc(qsv_ctx_);
+        fc = (AVHWFramesContext*)hw_frame_ctx_->data;
+        fc->format            = AV_PIX_FMT_QSV;
+        fc->sw_format         = AV_PIX_FMT_NV12;
+        fc->width             = width_;
+        fc->height            = height_;
+        fc->initial_pool_size = 32;
+        use_nv12_fallback_     = true;
+        ret = av_hwframe_ctx_init(hw_frame_ctx_);
+        if (ret < 0) {
+            av_strerror(ret, e, sizeof(e));
+            fprintf(stderr, "[QSV] hwframe_ctx_init NV12: %s\n", e); return false;
+        }
+        printf("[QSV] Using NV12 hw frames (swscale path)\n");
+    } else {
+        printf("[QSV] BGRA hw frames accepted! No color conversion needed.\n");
     }
 
     // --- h264_qsv, Sunshine-aligned low-latency params ---
@@ -126,12 +146,20 @@ bool QsvEncoder::Init(ID3D11Device* cap_device, int width, int height, int fps)
     hw_frame_->height = height_;
     av_hwframe_get_buffer(hw_frame_ctx_, hw_frame_, 0);
 
-    // --- sw NV12 frame (reuse each frame) ---
+    // --- sw frame for upload ---
     sw_frame_ = av_frame_alloc();
-    sw_frame_->format = AV_PIX_FMT_NV12;
-    sw_frame_->width  = width_;
-    sw_frame_->height = height_;
-    av_frame_get_buffer(sw_frame_, 64);  // 64-byte aligned
+    if (use_nv12_fallback_) {
+        sw_frame_->format = AV_PIX_FMT_NV12;
+        sw_frame_->width  = width_;
+        sw_frame_->height = height_;
+        av_frame_get_buffer(sw_frame_, 64);
+    } else {
+        // BGRA path: sw_frame is just a container, no buffer allocated
+        // data[0]/linesize[0] set per frame from the mapped staging pointer
+        sw_frame_->format = AV_PIX_FMT_BGRA;
+        sw_frame_->width  = width_;
+        sw_frame_->height = height_;
+    }
 
     return true;
 }
@@ -148,30 +176,44 @@ AVPacket* QsvEncoder::EncodeFrame(ID3D11Texture2D* src)
 {
     double t0 = NowMsQsv();
 
-    // Step 1: GPU copy DDA tex → staging (same Intel adapter)
+    // GPU copy DDA tex → staging (same Intel adapter, always needed for CPU read)
     cap_context_->CopyResource(staging_tex_.Get(), src);
     double t1 = NowMsQsv();
 
-    // Step 2: CPU map staging → BGRA pointer
+    // CPU map
     D3D11_MAPPED_SUBRESOURCE m = {};
     if (FAILED(cap_context_->Map(staging_tex_.Get(), 0, D3D11_MAP_READ, 0, &m))) return nullptr;
     double t2 = NowMsQsv();
 
-    // Step 3: swscale BGRA → NV12 (SIMD)
-    const uint8_t* src_planes[1] = { (const uint8_t*)m.pData };
-    int src_strides[1] = { (int)m.RowPitch };
-    sws_scale(sws_ctx_, src_planes, src_strides, 0, height_,
-              sw_frame_->data, sw_frame_->linesize);
-    double t3 = NowMsQsv();
+    const uint8_t* bgra_ptr  = (const uint8_t*)m.pData;
+    int            bgra_stride = (int)m.RowPitch;
 
-    cap_context_->Unmap(staging_tex_.Get(), 0);
+    double t3 = NowMsQsv();
+    if (use_nv12_fallback_) {
+        // NV12 path: swscale BGRA→NV12
+        const uint8_t* src_planes[1] = { bgra_ptr };
+        int src_strides[1] = { bgra_stride };
+        sws_scale(sws_ctx_, src_planes, src_strides, 0, height_,
+                  sw_frame_->data, sw_frame_->linesize);
+    }
     double t4 = NowMsQsv();
 
-    // Step 4: upload NV12 sw frame → QSV hw frame
-    if (av_hwframe_transfer_data(hw_frame_, sw_frame_, 0) < 0) return nullptr;
+    cap_context_->Unmap(staging_tex_.Get(), 0);
+
+    // Upload to QSV hw frame
+    AVFrame* upload_src = sw_frame_;  // NV12 sw frame (fallback)
+    if (!use_nv12_fallback_) {
+        // BGRA path: fill sw_frame with BGRA data, upload directly
+        sw_frame_->data[0]     = (uint8_t*)bgra_ptr;
+        sw_frame_->linesize[0] = bgra_stride;
+    }
+    if (av_hwframe_transfer_data(hw_frame_, upload_src, 0) < 0) return nullptr;
+    if (!use_nv12_fallback_) {
+        sw_frame_->data[0]     = nullptr;
+        sw_frame_->linesize[0] = 0;
+    }
     double t5 = NowMsQsv();
 
-    // Step 5: QSV encode
     hw_frame_->pts = pts_++;
     if (avcodec_send_frame(codec_ctx_, hw_frame_) < 0) return nullptr;
     double t6 = NowMsQsv();
@@ -180,10 +222,10 @@ AVPacket* QsvEncoder::EncodeFrame(ID3D11Texture2D* src)
     bool got_pkt = avcodec_receive_packet(codec_ctx_, pkt) == 0;
     double t7 = NowMsQsv();
 
-    // Print breakdown every 60 frames
     if (pts_ % 60 == 1) {
-        printf("  [QSV breakdown] gpu_copy=%.2f map=%.2f swscale=%.2f unmap=%.2f upload=%.2f send=%.2f recv=%.2f | total=%.2f ms\n",
-               t1-t0, t2-t1, t3-t2, t4-t3, t5-t4, t6-t5, t7-t6, t7-t0);
+        const char* path = use_nv12_fallback_ ? "NV12+swscale" : "BGRA direct";
+        printf("  [QSV %s] copy=%.2f map=%.2f conv=%.2f upload=%.2f send=%.2f | total=%.2f ms\n",
+               path, t1-t0, t2-t1, t4-t3, t5-t4, t6-t5, t7-t0);
     }
 
     if (got_pkt) return pkt;
