@@ -197,6 +197,24 @@ src_tex, array_idx + array_size // UV plane
 
 ---
 
+## 七、Live Pipeline vs Benchmark 的延迟差异
+
+**现象：**
+- 纯 benchmark（无 renderer）: NVENC e2e = 10.94ms
+- Live pipeline（有 renderer）: NVENC e2e = 14~20ms，encode 从 9ms 抖动到 17ms
+
+**原因：** Renderer 和 NVENC 共用 RTX 4060，互相竞争 GPU 资源。
+- NVENC `send` 时间从 6ms 增到 6~17ms（GPU 调度等待）
+- CPU xfer 从 3ms 增到 4~8ms（GPU 命令队列更长）
+
+**Sunshine 的解决方案：** Capture+Encode 在独立的 server 进程，不含本地 renderer，
+本地桌面仍由 iGPU 渲染，NVENC 独占 dGPU。
+
+**结论：** 实际串流产品里 Encoder 不应和 Renderer 共 GPU。此 demo 的 renderer
+仅用于验证，实测端到端延迟应以 `--e2e` benchmark 结果（10.94ms）为准。
+
+---
+
 ## 六、硬件与驱动限制汇总
 
 | 限制 | 描述 |

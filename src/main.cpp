@@ -65,86 +65,132 @@ static void PumpMessages()
     }
 }
 
-// ---- NVENC live pipeline ---------------------------------------------------
+// ---- NVENC live pipeline (optimal path) ------------------------------------
+// DDA(Intel iGPU) -[CPU xfer]-> NVENC(RTX, delay=0) -> NVDEC(d3d11va) -> D3D11 render
+// All timing uses pts tracking for accurate E2E measurement.
 static int RunNvenc(HWND hwnd)
 {
-    printf("\n=== NVENC Pipeline (Intel DDA -> NVENC -> d3d11va decode -> D3D11 render) ===\n");
+    printf("\n=== Optimal Pipeline: DDA -> NVENC(delay=0) -> NVDEC -> D3D11 ===\n");
+    printf("Timing legend:\n");
+    printf("  dda_wait : AcquireFrame block (display refresh wait, NOT latency)\n");
+    printf("  encode   : CPU xfer + NVENC HW encode (frame ready -> packet out)\n");
+    printf("  decode   : NVDEC decode (packet -> NV12 texture)\n");
+    printf("  render   : D3D11 Present\n");
+    printf("  e2e      : encode + decode + render (true processing latency)\n\n");
 
     DDACapture capture;
     if (!capture.Init(0)) { fprintf(stderr, "DDA init failed\n"); return 1; }
     int W = capture.Width(), H = capture.Height();
 
     NvencEncoder encoder;
-    if (!encoder.Init(capture.GetDevice(), W, H, TARGET_FPS)) { fprintf(stderr, "NVENC init failed\n"); return 1; }
+    if (!encoder.Init(capture.GetDevice(), W, H, TARGET_FPS)) {
+        fprintf(stderr, "NVENC init failed\n"); return 1;
+    }
 
     NvdecDecoder decoder;
-    if (!decoder.Init(encoder.GetEncDevice(), W, H)) { fprintf(stderr, "NVDEC init failed\n"); return 1; }
+    if (!decoder.Init(encoder.GetEncDevice(), W, H)) {
+        fprintf(stderr, "NVDEC init failed\n"); return 1;
+    }
 
     D3D11Renderer renderer;
     g_renderer = &renderer;
     RECT rc; GetClientRect(hwnd, &rc);
     int dw = rc.right - rc.left, dh = rc.bottom - rc.top;
-    if (!dw) dw = W/2; if (!dh) dh = H/2;
-    if (!renderer.Init(hwnd, encoder.GetEncDevice(), dw, dh)) { fprintf(stderr, "Renderer init failed\n"); return 1; }
+    if (!dw) dw = W / 2; if (!dh) dh = H / 2;
+    if (!renderer.Init(hwnd, encoder.GetEncDevice(), dw, dh)) {
+        fprintf(stderr, "Renderer init failed\n"); return 1;
+    }
 
-    printf("%-8s %-10s %-10s %-10s %-10s %-10s\n",
-           "Frame", "Cap(ms)", "Enc(ms)", "Dec(ms)", "Ren(ms)", "Total(ms)");
+    printf("%-6s  %-9s %-9s %-9s %-9s %-9s\n",
+           "Frame", "dda_wait", "encode", "decode", "render", "e2e");
+    printf("%-6s  %-9s %-9s %-9s %-9s %-9s\n",
+           "------", "--------", "--------", "--------", "--------", "--------");
 
-    PerfStats stats;
-    int frame_count = 0;
+    // Rolling averages (120-frame window)
+    RollingAvg<120> dda_avg, enc_avg, dec_avg, ren_avg, e2e_avg;
+
+    // pts -> capture wall time (for E2E tracking)
+    std::unordered_map<int64_t, double> cap_time;
+    int64_t pts_in  = 0;
+    int     frame_count = 0;
 
     while (g_running) {
         PumpMessages();
         if (!g_running) break;
 
-        stats.OnFrameStart();
-        double t_start = NowMs();
-
-        double t0 = NowMs();
+        // --- DDA: wait for next desktop frame ---
+        double t_wait0 = NowMs();
         CaptureFrame cap_frame;
         if (!capture.AcquireFrame(cap_frame, FRAME_BUDGET)) continue;
-        double capture_ms = NowMs() - t0;
-        stats.capture_ms.Add(capture_ms);
+        double dda_wait = NowMs() - t_wait0;
+        dda_avg.Add(dda_wait);
 
-        double t1 = NowMs();
-        AVPacket* pkt = encoder.EncodeFrame(cap_frame.texture.Get());
+        // --- Record capture time for E2E tracking ---
+        int64_t this_pts = pts_in++;
+        cap_time[this_pts] = NowMs();  // frame just arrived
+
+        // --- NVENC encode (delay=0: synchronous, packet = this frame) ---
+        double t_enc0 = NowMs();
+        AVPacket* pkt = encoder.EncodeFrame(cap_frame.texture.Get(), this_pts);
         capture.ReleaseFrame();
-        double encode_ms = NowMs() - t1;
-        stats.encode_ms.Add(encode_ms);
+        double enc_ms = NowMs() - t_enc0;
+        enc_avg.Add(enc_ms);
         if (!pkt) continue;
 
-        double t2 = NowMs();
+        // --- NVDEC decode ---
+        double t_dec0 = NowMs();
         DecodedFrame dec_frame;
         bool decoded = decoder.Decode(pkt, dec_frame);
+        int64_t pkt_pts = pkt->pts;
         av_packet_free(&pkt);
-        double decode_ms = NowMs() - t2;
-        stats.decode_ms.Add(decode_ms);
+        double dec_ms = NowMs() - t_dec0;
+        dec_avg.Add(dec_ms);
         if (!decoded) continue;
 
-        double t3 = NowMs();
+        // --- D3D11 render ---
+        double t_ren0 = NowMs();
         renderer.RenderNV12(dec_frame.texture.Get());
-        double render_ms = NowMs() - t3;
-        stats.render_ms.Add(render_ms);
+        double ren_ms = NowMs() - t_ren0;
+        ren_avg.Add(ren_ms);
 
-        double total_ms = NowMs() - t_start;
-        stats.total_ms.Add(total_ms);
+        // --- E2E latency (frame arrived -> render complete) ---
+        double e2e_ms = 0;
+        auto it = cap_time.find(pkt_pts);
+        if (it != cap_time.end()) {
+            e2e_ms = NowMs() - it->second;
+            e2e_avg.Add(e2e_ms);
+            cap_time.erase(it);
+        }
+        if (cap_time.size() > 32) cap_time.clear();
+
         frame_count++;
 
+        // Console: print rolling avg every 60 frames
         if (frame_count % 60 == 0) {
-            printf("%-8d %-10.2f %-10.2f %-10.2f %-10.2f %-10.2f\n",
+            printf("%-6d  %-9.2f %-9.2f %-9.2f %-9.2f %-9.2f\n",
                    frame_count,
-                   stats.capture_ms.Avg(), stats.encode_ms.Avg(),
-                   stats.decode_ms.Avg(), stats.render_ms.Avg(),
-                   stats.total_ms.Avg());
+                   dda_avg.Avg(), enc_avg.Avg(),
+                   dec_avg.Avg(), ren_avg.Avg(), e2e_avg.Avg());
         }
-        if (frame_count % 10 == 0)
-            renderer.SetTitle(stats.Summary() + " [NVENC] ESC=quit");
 
-        double elapsed = NowMs() - t_start;
-        if (elapsed < FRAME_BUDGET) Sleep((DWORD)(FRAME_BUDGET - elapsed));
+        // Window title: update every 10 frames
+        if (frame_count % 10 == 0 && e2e_avg.Avg() > 0) {
+            char title[256];
+            snprintf(title, sizeof(title),
+                "E2E=%.1fms  enc=%.1fms  dec=%.1fms  ren=%.1fms  [dda_wait=%.1fms]  ESC=quit",
+                e2e_avg.Avg(), enc_avg.Avg(), dec_avg.Avg(), ren_avg.Avg(), dda_avg.Avg());
+            renderer.SetTitle(title);
+        }
     }
 
-    printf("\nNVENC final: %s\n", stats.Summary().c_str());
+    printf("\n=== Session Summary ===\n");
+    printf("Frames rendered : %d\n", frame_count);
+    printf("dda_wait avg    : %.2f ms (display refresh wait)\n", dda_avg.Avg());
+    printf("encode avg      : %.2f ms\n", enc_avg.Avg());
+    printf("decode avg      : %.2f ms\n", dec_avg.Avg());
+    printf("render avg      : %.2f ms\n", ren_avg.Avg());
+    printf("E2E avg         : %.2f ms  <-- true processing latency\n", e2e_avg.Avg());
+
     g_renderer = nullptr;
     return 0;
 }
