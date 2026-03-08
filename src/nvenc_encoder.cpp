@@ -59,6 +59,11 @@ bool NvencEncoder::Init(ID3D11Device* capture_device, int width, int height, int
 
     same_adapter_ = SameAdapter(capture_device, enc_device_.Get());
 
+    // Cache capture context + create GPU-done query for pipelined mode
+    capture_device->GetImmediateContext(&cap_context_);
+    D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
+    cap_device_->CreateQuery(&qd, &cap_sync_q_);
+
     if (same_adapter_) {
         xfer_mode_ = XferMode::SameAdapter;
         printf("[NVENC] Transfer: same adapter (direct copy)\n");
@@ -112,23 +117,29 @@ bool NvencEncoder::Init(ID3D11Device* capture_device, int width, int height, int
     codec_ctx_->gop_size       = fps_;
 
     auto* p = codec_ctx_->priv_data;
-    av_opt_set    (p, "preset",         "p4",  0);
-    av_opt_set    (p, "tune",           "ull", 0);
-    av_opt_set    (p, "rc",             "cbr", 0);
-    av_opt_set    (p, "profile",        "high",0);
-    av_opt_set_int(p, "b",         10000000,   0);
-    av_opt_set_int(p, "bufsize",   10000000,   0);
-    av_opt_set_int(p, "rc-lookahead",   0,     0);
-    av_opt_set_int(p, "no-scenecut",    1,     0);
-    av_opt_set_int(p, "forced-idr",     1,     0);
-    av_opt_set_int(p, "delay",          0,     0);  // async_depth=1 (no pipeline buffering)
+    // Preset p1 (fastest) matches Sunshine's default for low-latency streaming.
+    // cbr_ld_hq: NVENC low-delay CBR mode, ~20-30% faster than plain cbr at same quality.
+    // delay=0: async_depth=1, every send_frame produces a packet immediately (min latency).
+    av_opt_set    (p, "preset",         "p1",       0);
+    av_opt_set    (p, "tune",           "ull",      0);   // NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY
+    av_opt_set    (p, "rc",             "cbr_ld_hq",0);   // low-delay CBR (~20-30% faster)
+    av_opt_set    (p, "profile",        "high",     0);
+    av_opt_set_int(p, "b",         10000000,        0);
+    av_opt_set_int(p, "bufsize",    5000000,        0);   // tighter buffer = less latency
+    av_opt_set_int(p, "rc-lookahead",   0,          0);   // disable lookahead
+    av_opt_set_int(p, "no-scenecut",    1,          0);
+    av_opt_set_int(p, "forced-idr",     1,          0);   // IDR on request
+    av_opt_set_int(p, "delay",          0,          0);   // sync encode, one pkt per frame
+    av_opt_set_int(p, "zerolatency",    1,          0);   // disable NVENC async queue (Sunshine)
+    av_opt_set_int(p, "surfaces",       1,          0);   // 1 concurrent surface (Sunshine)
 
     int ret = avcodec_open2(codec_ctx_, codec, nullptr);
     if (ret < 0) {
         char e[128]; av_strerror(ret, e, sizeof(e));
         fprintf(stderr, "[NVENC] avcodec_open2: %s\n", e); return false;
     }
-    printf("[NVENC] h264_nvenc ready %dx%d @ %dfps, 10Mbps CBR, preset=p4/ull\n",
+    printf("[NVENC] h264_nvenc ready %dx%d @ %dfps, 10Mbps CBR, "
+           "preset=p1/ull/cbr_ld_hq zerolatency=1 surfaces=1\n",
            width_, height_, fps_);
 
     hw_frame_ = av_frame_alloc();
@@ -281,8 +292,61 @@ AVPacket* NvencEncoder::Flush()
     return nullptr;
 }
 
+// ---- Pipelined mode: Step 1 (capture thread) --------------------------------
+// Copies DDA texture to the cross-adapter shared texture (Intel side).
+// CPU-blocks until the Intel GPU finishes the copy (D3D11_QUERY_EVENT).
+// Call capture.ReleaseFrame() immediately after this returns.
+bool NvencEncoder::CopyFromCapture(ID3D11Texture2D* src)
+{
+    if (xfer_mode_ != XferMode::ZeroCopy) {
+        // Fallback: run the full copy inline (no pipeline benefit, but correct).
+        return CopyToEncoderTexture(src);
+    }
+
+    // Intel GPU copies DDA tex → shared cross-adapter tex.
+    cap_context_->CopyResource(shared_tex_intel_.Get(), src);
+
+    // Flush ensures the copy command is submitted to the Intel GPU driver.
+    cap_context_->Flush();
+
+    // CPU-wait until Intel GPU is actually done writing the shared texture.
+    // This guarantees NVIDIA can safely read it via shared_tex_nvidia_ afterwards.
+    cap_context_->End(cap_sync_q_.Get());
+    BOOL done = FALSE;
+    while (cap_context_->GetData(cap_sync_q_.Get(), &done, sizeof(BOOL), 0) != S_OK || !done)
+        SwitchToThread();  // yield rather than spin-burn
+
+    return true;
+}
+
+// ---- Pipelined mode: Step 2 (encode thread) ---------------------------------
+// Copies shared tex → hw_frame (NVIDIA side), then runs avcodec encode.
+// Only call after CopyFromCapture has returned (shared tex is stable).
+AVPacket* NvencEncoder::EncodeFromShared(int64_t pts)
+{
+    auto* dst     = (ID3D11Texture2D*)hw_frame_->data[0];
+    UINT  dst_idx = (UINT)(intptr_t)hw_frame_->data[1];
+
+    if (xfer_mode_ == XferMode::ZeroCopy) {
+        // NVIDIA reads from its view of the cross-adapter shared texture.
+        enc_context_->CopySubresourceRegion(dst, dst_idx, 0, 0, 0,
+                                             shared_tex_nvidia_.Get(), 0, nullptr);
+    }
+    // For SameAdapter/CpuRoundtrip: CopyFromCapture already wrote hw_frame_ directly.
+
+    hw_frame_->pts = (pts >= 0) ? pts : pts_++;
+    if (avcodec_send_frame(codec_ctx_, hw_frame_) < 0) return nullptr;
+
+    AVPacket* pkt = av_packet_alloc();
+    if (avcodec_receive_packet(codec_ctx_, pkt) == 0) return pkt;
+    av_packet_free(&pkt);
+    return nullptr;
+}
+
 void NvencEncoder::Release()
 {
+    cap_sync_q_.Reset();
+    cap_context_.Reset();
     mutex_nvidia_.Reset();
     mutex_intel_.Reset();
     shared_tex_nvidia_.Reset();
