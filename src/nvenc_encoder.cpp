@@ -113,22 +113,26 @@ bool NvencEncoder::Init(ID3D11Device* capture_device, int width, int height, int
 
     auto* p = codec_ctx_->priv_data;
     av_opt_set    (p, "preset",         "p4",  0);
-    av_opt_set    (p, "tune",           "ull", 0);
-    av_opt_set    (p, "rc",             "cbr", 0);
+    av_opt_set    (p, "tune",           "ull", 0);   // NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY
+    av_opt_set    (p, "rc",             "cbr", 0);   // NV_ENC_PARAMS_RC_CBR (stable bitrate)
     av_opt_set    (p, "profile",        "high",0);
     av_opt_set_int(p, "b",         10000000,   0);
     av_opt_set_int(p, "bufsize",   10000000,   0);
-    av_opt_set_int(p, "rc-lookahead",   0,     0);
-    av_opt_set_int(p, "no-scenecut",    1,     0);
-    av_opt_set_int(p, "forced-idr",     1,     0);
-    av_opt_set_int(p, "delay",          0,     0);  // async_depth=1 (no pipeline buffering)
+    av_opt_set_int(p, "rc-lookahead",   0,     0);   // disable lookahead (adds latency)
+    av_opt_set_int(p, "no-scenecut",    1,     0);   // disable scene-cut detection
+    av_opt_set_int(p, "forced-idr",     1,     0);   // IDR on request (ref-frame invalidation)
+    av_opt_set_int(p, "delay",          0,     0);   // async_depth=1: no pipeline buffering
+    // Sunshine-specific low-latency params (not in demo before):
+    av_opt_set_int(p, "zerolatency",    1,     0);   // disable NVENC async encode queue entirely
+    av_opt_set_int(p, "surfaces",       1,     0);   // 1 concurrent surface = minimum latency
 
     int ret = avcodec_open2(codec_ctx_, codec, nullptr);
     if (ret < 0) {
         char e[128]; av_strerror(ret, e, sizeof(e));
         fprintf(stderr, "[NVENC] avcodec_open2: %s\n", e); return false;
     }
-    printf("[NVENC] h264_nvenc ready %dx%d @ %dfps, 10Mbps CBR, preset=p4/ull\n",
+    printf("[NVENC] h264_nvenc ready %dx%d @ %dfps, 10Mbps CBR, "
+           "preset=p4/ull zerolatency=1 surfaces=1\n",
            width_, height_, fps_);
 
     hw_frame_ = av_frame_alloc();

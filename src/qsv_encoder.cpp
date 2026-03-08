@@ -108,18 +108,22 @@ bool QsvEncoder::Init(ID3D11Device* cap_device, int width, int height, int fps)
     codec_ctx_->rc_buffer_size = 10000000;
 
     auto* p = codec_ctx_->priv_data;
-    av_opt_set    (p, "preset",       "veryfast", 0);
-    av_opt_set    (p, "profile",      "high",     0);
-    av_opt_set    (p, "rc_mode",      "cbr",      0);
-    av_opt_set_int(p, "async_depth",  1,          0);  // critical for low latency
-    av_opt_set_int(p, "look_ahead",   0,          0);
+    av_opt_set    (p, "preset",         "veryfast", 0);
+    av_opt_set    (p, "profile",        "high",     0);
+    av_opt_set    (p, "rc_mode",        "cbr",      0);
+    av_opt_set_int(p, "async_depth",    1,          0); // critical: 1 = no pipeline depth
+    av_opt_set_int(p, "look_ahead",     0,          0); // disable lookahead (adds latency)
+    // Sunshine-specific low-latency params (not in demo before):
+    av_opt_set_int(p, "forced_idr",     1,          0); // IDR on request (Sunshine: forced_idr=1)
+    av_opt_set_int(p, "low_delay_brc",  1,          0); // low-delay bitrate control (Sunshine)
 
     ret = avcodec_open2(codec_ctx_, codec, nullptr);
     if (ret < 0) {
         char e[128]; av_strerror(ret, e, sizeof(e));
         fprintf(stderr, "[QSV] avcodec_open2: %s\n", e); return false;
     }
-    printf("[QSV] h264_qsv ready %dx%d @ %dfps, 10Mbps CBR, veryfast async_depth=1\n",
+    printf("[QSV] h264_qsv ready %dx%d @ %dfps, 10Mbps CBR, "
+           "veryfast async_depth=1 forced_idr=1 low_delay_brc=1\n",
            width_, height_, fps_);
 
     // --- Staging texture for CPU readback ---
@@ -132,7 +136,7 @@ bool QsvEncoder::Init(ID3D11Device* cap_device, int width, int height, int fps)
     sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     cap_device_->CreateTexture2D(&sd, nullptr, &staging_tex_);
 
-    // --- swscale context: BGRA â†?NV12 (SIMD-accelerated) ---
+    // --- swscale context: BGRA ï¿½?NV12 (SIMD-accelerated) ---
     sws_ctx_ = sws_getContext(
         width_, height_, AV_PIX_FMT_BGRA,
         width_, height_, AV_PIX_FMT_NV12,
@@ -176,7 +180,7 @@ AVPacket* QsvEncoder::EncodeFrame(ID3D11Texture2D* src, int64_t pts_override)
 {
     double t0 = NowMsQsv();
 
-    // GPU copy DDA tex â†?staging (same Intel adapter, always needed for CPU read)
+    // GPU copy DDA tex ï¿½?staging (same Intel adapter, always needed for CPU read)
     cap_context_->CopyResource(staging_tex_.Get(), src);
     double t1 = NowMsQsv();
 
